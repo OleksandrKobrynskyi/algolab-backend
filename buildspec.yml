@@ -10,4 +10,9 @@ phases:
   build:
     commands:
       - cd backend && mvn clean package -B
-      - cd ../infra && npm ci && npx cdk deploy --require-approval never
+      - cd ../infra && npm ci && npx cdk synth && npx cdk deploy --require-approval never
+
+cache:
+  paths:
+    - '/root/.m2/**/*'
+    - 'infra/node_modules/**/*'
