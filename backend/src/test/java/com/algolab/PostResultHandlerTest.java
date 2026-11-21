@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -130,7 +131,7 @@ class PostResultHandlerTest {
                 handler.handleRequest(post(payloadWithScore(95)), context);
 
         assertEquals(500, response.getStatusCode());
-        assertEquals("*", response.getHeaders().get("Access-Control-Allow-Origin"));
+        assertFalse(response.getHeaders().containsKey("Access-Control-Allow-Origin"));
         assertEquals("application/json", response.getHeaders().get("Content-Type"));
 
         JsonObject body = JsonParser.parseString(response.getBody()).getAsJsonObject();
@@ -146,7 +147,7 @@ class PostResultHandlerTest {
         APIGatewayProxyResponseEvent response = handler.handleRequest(request, context);
 
         assertEquals(200, response.getStatusCode());
-        assertEquals("*", response.getHeaders().get("Access-Control-Allow-Origin"));
+        assertFalse(response.getHeaders().containsKey("Access-Control-Allow-Origin"));
         verify(ddb, never()).putItem(any(PutItemRequest.class));
     }
 

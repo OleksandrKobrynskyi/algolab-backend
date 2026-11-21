@@ -46,8 +46,10 @@ public class PostResultHandler implements RequestHandler<APIGatewayProxyRequestE
     @Override
     public APIGatewayProxyResponseEvent handleRequest(APIGatewayProxyRequestEvent request,
                                                       Context context) {
+        Map<String, String> requestHeaders = request == null ? null : request.getHeaders();
+
         if (request != null && "OPTIONS".equalsIgnoreCase(request.getHttpMethod())) {
-            return CorsUtil.buildResponse(200, Map.of());
+            return CorsUtil.buildResponse(200, Map.of(), requestHeaders);
         }
 
         SubmissionRequest submission;
@@ -55,16 +57,16 @@ public class PostResultHandler implements RequestHandler<APIGatewayProxyRequestE
             String body = request == null ? null : request.getBody();
             submission = GSON.fromJson(body, SubmissionRequest.class);
         } catch (JsonSyntaxException e) {
-            return CorsUtil.buildResponse(400, Map.of("error", "Malformed JSON"));
+            return CorsUtil.buildResponse(400, Map.of("error", "Malformed JSON"), requestHeaders);
         }
 
         if (submission == null) {
-            return CorsUtil.buildResponse(400, Map.of("error", "Malformed JSON"));
+            return CorsUtil.buildResponse(400, Map.of("error", "Malformed JSON"), requestHeaders);
         }
 
         String validationError = submission.validate();
         if (validationError != null) {
-            return CorsUtil.buildResponse(400, Map.of("error", validationError));
+            return CorsUtil.buildResponse(400, Map.of("error", validationError), requestHeaders);
         }
 
         try {
@@ -89,7 +91,7 @@ public class PostResultHandler implements RequestHandler<APIGatewayProxyRequestE
             Map<String, Object> responseBody = new LinkedHashMap<>();
             responseBody.put("status", "saved");
             responseBody.put("submissionId", submissionId);
-            return CorsUtil.buildResponse(201, responseBody);
+            return CorsUtil.buildResponse(201, responseBody, requestHeaders);
         } catch (Exception e) {
             if (context != null) {
                 LambdaLogger logger = context.getLogger();
@@ -97,7 +99,7 @@ public class PostResultHandler implements RequestHandler<APIGatewayProxyRequestE
                     logger.log("Failed to save submission: " + e);
                 }
             }
-            return CorsUtil.buildResponse(500, Map.of("error", "Internal server error"));
+            return CorsUtil.buildResponse(500, Map.of("error", "Internal server error"), requestHeaders);
         }
     }
 }
