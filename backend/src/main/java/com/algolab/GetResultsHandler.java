@@ -69,15 +69,17 @@ public class GetResultsHandler implements RequestHandler<APIGatewayProxyRequestE
     @Override
     public APIGatewayProxyResponseEvent handleRequest(APIGatewayProxyRequestEvent request,
                                                       Context context) {
+        Map<String, String> requestHeaders = request == null ? null : request.getHeaders();
+
         if (request != null && "OPTIONS".equalsIgnoreCase(request.getHttpMethod())) {
-            return CorsUtil.buildResponse(200, Map.of());
+            return CorsUtil.buildResponse(200, Map.of(), requestHeaders);
         }
 
         String login = header(request, "X-Admin-Login");
         String password = header(request, "X-Admin-Password");
         if (!isAuthorized(login, password)) {
             return CorsUtil.buildResponse(401,
-                    Map.of("error", "Unauthorized: Invalid teacher credentials"));
+                    Map.of("error", "Unauthorized: Invalid teacher credentials"), requestHeaders);
         }
 
         Map<String, String> params = request == null ? null : request.getQueryStringParameters();
@@ -86,7 +88,7 @@ public class GetResultsHandler implements RequestHandler<APIGatewayProxyRequestE
         try {
             limit = parseLimit(params);
         } catch (NumberFormatException e) {
-            return CorsUtil.buildResponse(400, Map.of("error", "Invalid limit parameter"));
+            return CorsUtil.buildResponse(400, Map.of("error", "Invalid limit parameter"), requestHeaders);
         }
 
         String testName = trimToNull(params == null ? null : params.get("testName"));
@@ -138,10 +140,10 @@ public class GetResultsHandler implements RequestHandler<APIGatewayProxyRequestE
             body.put("items", items);
             body.put("count", items.size());
             body.put("nextKey", nextKey);
-            return CorsUtil.buildResponse(200, body);
+            return CorsUtil.buildResponse(200, body, requestHeaders);
         } catch (Exception e) {
             logError(context, "Could not read results", e);
-            return CorsUtil.buildResponse(500, Map.of("error", "Could not read results"));
+            return CorsUtil.buildResponse(500, Map.of("error", "Could not read results"), requestHeaders);
         }
     }
 
