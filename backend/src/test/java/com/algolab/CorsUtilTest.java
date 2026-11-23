@@ -12,15 +12,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CorsUtilTest {
 
+    private static final String PRODUCTION_ORIGIN = "https://oleksandrkobrynskyi.github.io";
+    private static final String LOCAL_ORIGIN = "http://localhost:5173";
     private static final String ALLOWED_ORIGINS =
-            "https://oleksandr2903.github.io, http://localhost:5173";
+            PRODUCTION_ORIGIN + ", " + LOCAL_ORIGIN;
 
     @Test
     void shouldEchoAllowedOriginAndVaryHeader() {
         Map<String, String> headers = CorsUtil.defaultHeaders(
-                Map.of("Origin", "https://oleksandr2903.github.io"), ALLOWED_ORIGINS);
+                Map.of("Origin", PRODUCTION_ORIGIN), ALLOWED_ORIGINS);
 
-        assertEquals("https://oleksandr2903.github.io",
+        assertEquals(PRODUCTION_ORIGIN,
                 headers.get("Access-Control-Allow-Origin"));
         assertEquals("Origin", headers.get("Vary"));
         assertEquals("application/json", headers.get("Content-Type"));
@@ -32,7 +34,7 @@ class CorsUtilTest {
     @Test
     void shouldOmitAllowOriginForDisallowedOrigin() {
         Map<String, String> headers = CorsUtil.defaultHeaders(
-                Map.of("Origin", "https://evil.example.com"), ALLOWED_ORIGINS);
+                Map.of("Origin", "https://evil.example"), ALLOWED_ORIGINS);
 
         assertFalse(headers.containsKey("Access-Control-Allow-Origin"));
         assertFalse(headers.containsKey("Vary"));
@@ -55,15 +57,24 @@ class CorsUtilTest {
     }
 
     @Test
+    void shouldAllowLocalDevelopmentOrigin() {
+        Map<String, String> headers = CorsUtil.defaultHeaders(
+                Map.of("Origin", LOCAL_ORIGIN), ALLOWED_ORIGINS);
+
+        assertEquals(LOCAL_ORIGIN, headers.get("Access-Control-Allow-Origin"));
+        assertEquals("Origin", headers.get("Vary"));
+    }
+
+    @Test
     void shouldLookUpOriginHeaderCaseInsensitively() {
         Map<String, String> lowerCase = CorsUtil.defaultHeaders(
-                Map.of("origin", "http://localhost:5173"), ALLOWED_ORIGINS);
+                Map.of("origin", LOCAL_ORIGIN), ALLOWED_ORIGINS);
         Map<String, String> upperCase = CorsUtil.defaultHeaders(
-                Map.of("ORIGIN", "http://localhost:5173"), ALLOWED_ORIGINS);
+                Map.of("ORIGIN", LOCAL_ORIGIN), ALLOWED_ORIGINS);
 
-        assertEquals("http://localhost:5173",
+        assertEquals(LOCAL_ORIGIN,
                 lowerCase.get("Access-Control-Allow-Origin"));
-        assertEquals("http://localhost:5173",
+        assertEquals(LOCAL_ORIGIN,
                 upperCase.get("Access-Control-Allow-Origin"));
     }
 
@@ -86,10 +97,10 @@ class CorsUtilTest {
     void shouldBuildResponseWithCorsHeadersForAllowedOrigin() {
         APIGatewayProxyResponseEvent response = CorsUtil.buildResponse(
                 201, Map.of("status", "saved"),
-                Map.of("Origin", "http://localhost:5173"), ALLOWED_ORIGINS);
+                Map.of("Origin", LOCAL_ORIGIN), ALLOWED_ORIGINS);
 
         assertEquals(201, response.getStatusCode());
-        assertEquals("http://localhost:5173",
+        assertEquals(LOCAL_ORIGIN,
                 response.getHeaders().get("Access-Control-Allow-Origin"));
         assertEquals("Origin", response.getHeaders().get("Vary"));
         assertEquals("{\"status\":\"saved\"}", response.getBody());

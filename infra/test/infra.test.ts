@@ -3,7 +3,7 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 import { InfraStack } from '../lib/infra-stack';
 
 const DEFAULT_ALLOWED_ORIGINS =
-  'https://oleksandr2903.github.io,http://localhost:5173';
+  'https://oleksandrkobrynskyi.github.io,http://localhost:5173';
 
 type EnvOverrides = Record<string, string | undefined>;
 
@@ -161,6 +161,19 @@ describe('InfraStack', () => {
     });
   });
 
+  test('preflight uses the primary origin, allows localhost, and never a wildcard', () => {
+    const template = synthStack('PreflightAllowlistStack', defaultEnv);
+
+    const preflightMethods = template.findResources('AWS::ApiGateway::Method', {
+      Properties: { HttpMethod: 'OPTIONS' },
+    });
+    const serialized = JSON.stringify(preflightMethods);
+
+    expect(serialized).toContain("'https://oleksandrkobrynskyi.github.io'");
+    expect(serialized).toContain('http://localhost:5173');
+    expect(serialized).not.toContain('*');
+  });
+
   test('request validator validates body', () => {
     const template = synthStack('ValidatorStack', defaultEnv);
 
@@ -202,7 +215,7 @@ describe('InfraStack', () => {
         ResponseType: type,
         ResponseParameters: {
           'gatewayresponse.header.Access-Control-Allow-Origin':
-            "'https://oleksandr2903.github.io'",
+            "'https://oleksandrkobrynskyi.github.io'",
           'gatewayresponse.header.Access-Control-Allow-Headers':
             "'Content-Type,X-Admin-Login,X-Admin-Password'",
           'gatewayresponse.header.Access-Control-Allow-Methods': "'OPTIONS,GET,POST'",
