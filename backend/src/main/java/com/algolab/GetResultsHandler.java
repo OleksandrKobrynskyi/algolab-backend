@@ -9,7 +9,9 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
 import com.google.gson.reflect.TypeToken;
+import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
@@ -19,6 +21,7 @@ import software.amazon.awssdk.services.dynamodb.model.ScanRequest;
 import software.amazon.awssdk.services.dynamodb.model.ScanResponse;
 
 import java.lang.reflect.Type;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
@@ -26,6 +29,7 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Handles GET /results: reads submissions with optional filtering by test name
@@ -40,6 +44,15 @@ public class GetResultsHandler implements RequestHandler<APIGatewayProxyRequestE
     private static final int DEFAULT_LIMIT = 100;
     private static final int MIN_LIMIT = 1;
     private static final int MAX_LIMIT = 10000;
+    private static final int MAX_TEST_NAME_LENGTH = 100;
+
+    private static final String TABLE_PARTITION_KEY = "submissionId";
+    private static final String GSI_PARTITION_KEY = "testName";
+    private static final String GSI_SORT_KEY = "createdAt";
+
+    private static final Set<String> SCAN_CURSOR_KEYS = Set.of(TABLE_PARTITION_KEY);
+    private static final Set<String> GSI_CURSOR_KEYS =
+            Set.of(TABLE_PARTITION_KEY, GSI_PARTITION_KEY, GSI_SORT_KEY);
 
     private final DynamoDbClient ddb;
     private final String tableName;
@@ -92,11 +105,21 @@ public class GetResultsHandler implements RequestHandler<APIGatewayProxyRequestE
         }
 
         String testName = trimToNull(params == null ? null : params.get("testName"));
+        if (testName != null && testName.length() > MAX_TEST_NAME_LENGTH) {
+            return CorsUtil.buildResponse(400, Map.of(
+                    "error", "Invalid testName parameter: must be at most "
+                            + MAX_TEST_NAME_LENGTH + " characters"), requestHeaders);
+        }
+
+        Map<String, AttributeValue> exclusiveStartKey;
+        try {
+            exclusiveStartKey = decodeLastKey(params == null ? null : params.get("lastKey"));
+            validateCursorForMode(exclusiveStartKey, testName);
+        } catch (InvalidCursorException e) {
+            return CorsUtil.buildResponse(400, Map.of("error", e.getMessage()), requestHeaders);
+        }
 
         try {
-            Map<String, AttributeValue> exclusiveStartKey =
-                    decodeLastKey(params == null ? null : params.get("lastKey"));
-
             List<Map<String, AttributeValue>> rawItems;
             Map<String, AttributeValue> lastEvaluatedKey;
 
@@ -263,57 +286,96 @@ public class GetResultsHandler implements RequestHandler<APIGatewayProxyRequestE
         }
     }
 
-    private static String encodeLastKey(Map<String, AttributeValue> lastEvaluatedKey) {
+    static String encodeLastKey(Map<String, AttributeValue> lastEvaluatedKey) {
         if (lastEvaluatedKey == null || lastEvaluatedKey.isEmpty()) {
             return null;
         }
-        Map<String, String> simpleKey = new LinkedHashMap<>();
+        Map<String, JsonObject> typedKey = new LinkedHashMap<>();
         for (Map.Entry<String, AttributeValue> entry : lastEvaluatedKey.entrySet()) {
+            String attributeName = entry.getKey();
             AttributeValue value = entry.getValue();
-            if (entry.getKey() == null || value == null) {
+            if (attributeName == null || attributeName.isBlank() || value == null) {
                 continue;
             }
-            if (value.s() != null) {
-                simpleKey.put(entry.getKey(), value.s());
-            } else if (value.n() != null) {
-                simpleKey.put(entry.getKey(), value.n());
-            } else if (value.bool() != null) {
-                simpleKey.put(entry.getKey(), String.valueOf(value.bool()));
-            } else if (value.b() != null) {
-                simpleKey.put(entry.getKey(), Base64.getEncoder().encodeToString(value.b().asByteArray()));
+            JsonObject typedValue = encodeAttributeValue(value);
+            if (typedValue != null) {
+                typedKey.put(attributeName, typedValue);
             }
         }
-        if (simpleKey.isEmpty()) {
+        if (typedKey.isEmpty()) {
             return null;
         }
-        String json = GSON.toJson(simpleKey);
+        String json = GSON.toJson(typedKey);
         return Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(json.getBytes(StandardCharsets.UTF_8));
     }
 
-    private static Map<String, AttributeValue> decodeLastKey(String rawLastKey) {
+    private static JsonObject encodeAttributeValue(AttributeValue value) {
+        JsonObject typedValue = new JsonObject();
+        if (value.s() != null) {
+            typedValue.addProperty("S", value.s());
+        } else if (value.n() != null) {
+            typedValue.addProperty("N", value.n());
+        } else if (value.b() != null) {
+            typedValue.addProperty("B",
+                    Base64.getEncoder().encodeToString(value.b().asByteArray()));
+        } else if (value.bool() != null) {
+            typedValue.addProperty("BOOL", value.bool());
+        } else {
+            return null;
+        }
+        return typedValue;
+    }
+
+    static Map<String, AttributeValue> decodeLastKey(String rawLastKey) {
         if (rawLastKey == null || rawLastKey.isBlank()) {
             return null;
         }
         String raw = rawLastKey.trim();
 
+        // Base64 is the canonical cursor encoding. Raw JSON objects are also
+        // accepted for convenience, but anything else is a hard failure.
         String json = decodeBase64(raw);
-        if (json != null) {
-            Map<String, AttributeValue> parsed = parseJsonKey(json);
-            if (parsed != null) {
-                return parsed;
+        if (json == null) {
+            if (!raw.startsWith("{")) {
+                throw invalidCursor("lastKey must be a Base64-encoded JSON cursor");
             }
+            json = raw;
+        }
+        return parseJsonKey(json);
+    }
+
+    private static void validateCursorForMode(Map<String, AttributeValue> cursor, String testName) {
+        if (cursor == null) {
+            return;
+        }
+        if (testName == null) {
+            if (!cursor.keySet().equals(SCAN_CURSOR_KEYS)) {
+                throw invalidCursor("cursor does not match scan mode: expected keys "
+                        + SCAN_CURSOR_KEYS + " but got " + cursor.keySet());
+            }
+            requireStringKey(cursor, TABLE_PARTITION_KEY, "scan cursor");
+            return;
         }
 
-        // Also accept a raw JSON cursor (useful when a client sends it unencoded).
-        if (raw.startsWith("{")) {
-            Map<String, AttributeValue> parsed = parseJsonKey(raw);
-            if (parsed != null) {
-                return parsed;
-            }
+        if (!cursor.keySet().equals(GSI_CURSOR_KEYS)) {
+            throw invalidCursor("cursor does not match testName query mode: expected keys "
+                    + GSI_CURSOR_KEYS + " but got " + cursor.keySet());
         }
+        String cursorTestName = requireStringKey(cursor, GSI_PARTITION_KEY, "testName query cursor");
+        requireStringKey(cursor, GSI_SORT_KEY, "testName query cursor");
+        if (!testName.equals(cursorTestName)) {
+            throw invalidCursor("cursor testName does not match the requested testName");
+        }
+    }
 
-        return Map.of("submissionId", AttributeValue.fromS(raw));
+    private static String requireStringKey(Map<String, AttributeValue> cursor, String attributeName,
+                                           String context) {
+        AttributeValue value = cursor.get(attributeName);
+        if (value == null || value.s() == null) {
+            throw invalidCursor(context + " requires string attribute '" + attributeName + "'");
+        }
+        return value.s();
     }
 
     private static String decodeBase64(String value) {
@@ -331,26 +393,116 @@ public class GetResultsHandler implements RequestHandler<APIGatewayProxyRequestE
     }
 
     private static Map<String, AttributeValue> parseJsonKey(String json) {
-        if (json == null || json.isBlank()) {
-            return null;
+        JsonElement parsed;
+        try {
+            parsed = JsonParser.parseString(json);
+        } catch (JsonParseException | IllegalStateException e) {
+            throw invalidCursor("lastKey is not valid JSON");
+        }
+        if (!parsed.isJsonObject()) {
+            throw invalidCursor("lastKey must decode to a JSON object");
+        }
+        JsonObject object = parsed.getAsJsonObject();
+        if (object.isEmpty()) {
+            throw invalidCursor("lastKey must contain at least one key attribute");
+        }
+
+        Map<String, AttributeValue> key = new LinkedHashMap<>();
+        for (Map.Entry<String, JsonElement> entry : object.entrySet()) {
+            String attributeName = entry.getKey();
+            if (attributeName == null || attributeName.isBlank()) {
+                throw invalidCursor("lastKey contains an empty attribute name");
+            }
+            JsonElement value = entry.getValue();
+            if (value == null || !value.isJsonObject()) {
+                throw invalidCursor("lastKey attribute '" + attributeName
+                        + "' must be a typed JSON object");
+            }
+            JsonObject typedValue = value.getAsJsonObject();
+            if (typedValue.size() != 1) {
+                throw invalidCursor("lastKey attribute '" + attributeName
+                        + "' must contain exactly one type key");
+            }
+            Map.Entry<String, JsonElement> typeEntry = typedValue.entrySet().iterator().next();
+            key.put(attributeName, decodeAttributeValue(attributeName, typeEntry.getKey(),
+                    typeEntry.getValue()));
+        }
+        return key;
+    }
+
+    private static AttributeValue decodeAttributeValue(String attributeName, String type,
+                                                       JsonElement value) {
+        if (value == null || !value.isJsonPrimitive()) {
+            throw invalidCursor("lastKey attribute '" + attributeName
+                    + "' type " + type + " must be a JSON primitive");
+        }
+        JsonPrimitive primitive = value.getAsJsonPrimitive();
+        switch (type) {
+            case "S": {
+                if (!primitive.isString()) {
+                    throw invalidCursor("lastKey attribute '" + attributeName
+                            + "' type S must be a JSON string");
+                }
+                return AttributeValue.fromS(primitive.getAsString());
+            }
+            case "N": {
+                if (!primitive.isString()) {
+                    throw invalidCursor("lastKey attribute '" + attributeName
+                            + "' type N must be a numeric JSON string");
+                }
+                String number = primitive.getAsString();
+                if (!isValidDynamoNumber(number)) {
+                    throw invalidCursor("lastKey attribute '" + attributeName
+                            + "' type N is not a valid number");
+                }
+                return AttributeValue.fromN(number);
+            }
+            case "B": {
+                if (!primitive.isString()) {
+                    throw invalidCursor("lastKey attribute '" + attributeName
+                            + "' type B must be a Base64 JSON string");
+                }
+                byte[] bytes;
+                try {
+                    bytes = Base64.getDecoder().decode(primitive.getAsString());
+                } catch (IllegalArgumentException e) {
+                    throw invalidCursor("lastKey attribute '" + attributeName
+                            + "' type B is not valid Base64");
+                }
+                return AttributeValue.fromB(SdkBytes.fromByteArray(bytes));
+            }
+            case "BOOL": {
+                if (!primitive.isBoolean()) {
+                    throw invalidCursor("lastKey attribute '" + attributeName
+                            + "' type BOOL must be a JSON boolean");
+                }
+                return AttributeValue.fromBool(primitive.getAsBoolean());
+            }
+            default:
+                throw invalidCursor("lastKey attribute '" + attributeName
+                        + "' has an unsupported type '" + type + "'");
+        }
+    }
+
+    private static boolean isValidDynamoNumber(String number) {
+        if (number == null || number.isBlank()) {
+            return false;
         }
         try {
-            JsonElement parsed = JsonParser.parseString(json);
-            if (!parsed.isJsonObject()) {
-                return null;
-            }
-            JsonObject object = parsed.getAsJsonObject();
-            Map<String, AttributeValue> key = new LinkedHashMap<>();
-            for (Map.Entry<String, JsonElement> entry : object.entrySet()) {
-                JsonElement value = entry.getValue();
-                if (entry.getKey() == null || value == null || !value.isJsonPrimitive()) {
-                    continue;
-                }
-                key.put(entry.getKey(), AttributeValue.fromS(value.getAsString()));
-            }
-            return key.isEmpty() ? null : key;
-        } catch (JsonParseException | IllegalStateException e) {
-            return null;
+            new BigDecimal(number);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    private static InvalidCursorException invalidCursor(String message) {
+        return new InvalidCursorException("Invalid lastKey parameter: " + message);
+    }
+
+    static final class InvalidCursorException extends RuntimeException {
+        InvalidCursorException(String message) {
+            super(message);
         }
     }
 

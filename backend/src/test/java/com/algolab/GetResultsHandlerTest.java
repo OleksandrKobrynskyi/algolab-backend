@@ -11,6 +11,7 @@ import com.google.gson.reflect.TypeToken;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.QueryRequest;
@@ -28,6 +29,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -163,10 +165,9 @@ class GetResultsHandlerTest {
         assertFalse(nextKey.contains("="), "cursor must be unpadded Base64");
 
         String decoded = new String(Base64.getUrlDecoder().decode(nextKey), StandardCharsets.UTF_8);
-        Map<String, String> decodedKey = GSON.fromJson(decoded,
-                new TypeToken<Map<String, String>>() {
-                }.getType());
-        assertEquals(Map.of("submissionId", "sub-1"), decodedKey);
+        JsonObject decodedKey = JsonParser.parseString(decoded).getAsJsonObject();
+        assertEquals("sub-1",
+                decodedKey.getAsJsonObject("submissionId").get("S").getAsString());
 
         APIGatewayProxyResponseEvent secondResponse = handler.handleRequest(
                 authorizedRequest(Map.of("lastKey", nextKey)), context());
@@ -208,6 +209,241 @@ class GetResultsHandlerTest {
 
         assertEquals(400, response.getStatusCode());
         verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldAcceptTestNameOfExactly100Characters() {
+        String testName = "a".repeat(100);
+        when(mockDdb.query(any(QueryRequest.class)))
+                .thenReturn(QueryResponse.builder().items(List.of()).build());
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("testName", testName)), context());
+
+        assertEquals(200, response.getStatusCode());
+
+        ArgumentCaptor<QueryRequest> captor = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(mockDdb).query(captor.capture());
+        assertEquals(testName, captor.getValue().expressionAttributeValues().get(":tn").s());
+    }
+
+    @Test
+    void shouldReturn400WhenTestNameExceeds100Characters() {
+        for (String testName : List.of("a".repeat(101), "a".repeat(2500))) {
+            APIGatewayProxyResponseEvent response = handler.handleRequest(
+                    authorizedRequest(Map.of("testName", testName)), context());
+
+            assertEquals(400, response.getStatusCode());
+            assertTrue(body(response).get("error").getAsString().contains("testName"));
+            assertCorsHeadersPresent(response);
+        }
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldTrimTestNameBeforeModeSelectionAndCursorComparison() {
+        String gsiCursor = GetResultsHandler.encodeLastKey(gsiKey("MergeSort"));
+        when(mockDdb.query(any(QueryRequest.class)))
+                .thenReturn(QueryResponse.builder().items(List.of()).build());
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("testName", "  MergeSort  ", "lastKey", gsiCursor)),
+                context());
+
+        assertEquals(200, response.getStatusCode());
+
+        ArgumentCaptor<QueryRequest> captor = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(mockDdb).query(captor.capture());
+        assertEquals("MergeSort", captor.getValue().expressionAttributeValues().get(":tn").s());
+        assertEquals("MergeSort",
+                captor.getValue().exclusiveStartKey().get("testName").s());
+    }
+
+    @Test
+    void shouldTreatBlankTestNameAsUnfilteredScan() {
+        when(mockDdb.scan(any(ScanRequest.class)))
+                .thenReturn(ScanResponse.builder().items(List.of()).build());
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("testName", "   ")), context());
+
+        assertEquals(200, response.getStatusCode());
+        verify(mockDdb).scan(any(ScanRequest.class));
+        verify(mockDdb, never()).query(any(QueryRequest.class));
+    }
+
+    @Test
+    void shouldReturn400ForMalformedLastKeyWithoutFallingBackToSubmissionId() {
+        List<String> malformedCursors = List.of(
+                "sub-1",
+                "not-base64!!",
+                base64Url("not json"),
+                base64Url("[]"),
+                base64Url("{}"),
+                base64Url("{\"submissionId\":\"sub-1\"}"),
+                base64Url("{\"submissionId\":{\"X\":\"sub-1\"}}"),
+                base64Url("{\"submissionId\":{\"S\":\"sub-1\",\"N\":\"1\"}}"),
+                base64Url("{\"submissionId\":{\"S\":123}}"),
+                base64Url("{\"submissionId\":{\"N\":\"abc\"}}"),
+                base64Url("{\"submissionId\":{\"B\":\"!!!\"}}"),
+                base64Url("{\"submissionId\":{\"BOOL\":\"true\"}}"));
+
+        for (String cursor : malformedCursors) {
+            APIGatewayProxyResponseEvent response = handler.handleRequest(
+                    authorizedRequest(Map.of("lastKey", cursor)), context());
+
+            assertEquals(400, response.getStatusCode(), "cursor should be rejected: " + cursor);
+            assertTrue(body(response).get("error").getAsString().contains("lastKey"));
+            assertCorsHeadersPresent(response);
+        }
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldReturn400WhenBinaryCursorValueIsNotBase64() {
+        String cursor = base64Url("{\"submissionId\":{\"B\":\"not base64!\"}}");
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("lastKey", cursor)), context());
+
+        assertEquals(400, response.getStatusCode());
+        assertTrue(body(response).get("error").getAsString().contains("Base64"));
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldReturn400WhenNumericCursorValueIsNotNumeric() {
+        String cursor = base64Url("{\"submissionId\":{\"N\":\"twelve\"}}");
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("lastKey", cursor)), context());
+
+        assertEquals(400, response.getStatusCode());
+        assertTrue(body(response).get("error").getAsString().contains("number"));
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldReturn400WhenBooleanCursorValueIsNotBoolean() {
+        String cursor = base64Url("{\"submissionId\":{\"BOOL\":1}}");
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("lastKey", cursor)), context());
+
+        assertEquals(400, response.getStatusCode());
+        assertTrue(body(response).get("error").getAsString().contains("BOOL"));
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldReturn400WhenScanCursorIsUsedForGsiQuery() {
+        String scanCursor = GetResultsHandler.encodeLastKey(
+                Map.of("submissionId", AttributeValue.fromS("sub-1")));
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("testName", "MergeSort", "lastKey", scanCursor)),
+                context());
+
+        assertEquals(400, response.getStatusCode());
+        assertTrue(body(response).get("error").getAsString().contains("testName query mode"));
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldReturn400WhenGsiCursorIsUsedForScan() {
+        String gsiCursor = GetResultsHandler.encodeLastKey(gsiKey("MergeSort"));
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("lastKey", gsiCursor)), context());
+
+        assertEquals(400, response.getStatusCode());
+        assertTrue(body(response).get("error").getAsString().contains("scan mode"));
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldReturn400WhenGsiCursorTestNameDoesNotMatchRequest() {
+        String gsiCursor = GetResultsHandler.encodeLastKey(gsiKey("MergeSort"));
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("testName", "QuickSort", "lastKey", gsiCursor)),
+                context());
+
+        assertEquals(400, response.getStatusCode());
+        assertTrue(body(response).get("error").getAsString().contains("does not match"));
+        verifyNoInteractions(mockDdb);
+    }
+
+    @Test
+    void shouldPassMatchingGsiCursorToQuery() {
+        Map<String, AttributeValue> cursorKey = gsiKey("MergeSort");
+        String gsiCursor = GetResultsHandler.encodeLastKey(cursorKey);
+        when(mockDdb.query(any(QueryRequest.class)))
+                .thenReturn(QueryResponse.builder().items(List.of()).build());
+
+        APIGatewayProxyResponseEvent response = handler.handleRequest(
+                authorizedRequest(Map.of("testName", "MergeSort", "lastKey", gsiCursor)),
+                context());
+
+        assertEquals(200, response.getStatusCode());
+
+        ArgumentCaptor<QueryRequest> captor = ArgumentCaptor.forClass(QueryRequest.class);
+        verify(mockDdb).query(captor.capture());
+        assertEquals(cursorKey, captor.getValue().exclusiveStartKey());
+    }
+
+    @Test
+    void shouldRoundTripSNAndBooleanAttributeValueTypes() {
+        Map<String, AttributeValue> keyMap = new LinkedHashMap<>();
+        keyMap.put("stringKey", AttributeValue.fromS("some text"));
+        keyMap.put("numberKey", AttributeValue.fromN("123.45"));
+        keyMap.put("binaryKey", AttributeValue.fromB(
+                SdkBytes.fromByteArray(new byte[]{0, 1, 2, (byte) 0xFF})));
+        keyMap.put("booleanKey", AttributeValue.fromBool(true));
+
+        String encoded = GetResultsHandler.encodeLastKey(keyMap);
+        assertNotNull(encoded);
+
+        Map<String, AttributeValue> decoded = GetResultsHandler.decodeLastKey(encoded);
+        assertEquals(keyMap, decoded);
+        assertEquals(AttributeValue.fromS("some text"), decoded.get("stringKey"));
+        assertEquals(AttributeValue.fromN("123.45"), decoded.get("numberKey"));
+        assertEquals(AttributeValue.fromB(
+                        SdkBytes.fromByteArray(new byte[]{0, 1, 2, (byte) 0xFF})),
+                decoded.get("binaryKey"));
+        assertEquals(AttributeValue.fromBool(true), decoded.get("booleanKey"));
+    }
+
+    @Test
+    void shouldRejectInvalidBinaryAndNumericValuesInCodec() {
+        String badBinary = base64Url("{\"binaryKey\":{\"B\":\"not base64!\"}}");
+        String badNumber = base64Url("{\"numberKey\":{\"N\":\"NaN-ish\"}}");
+
+        assertThrows(GetResultsHandler.InvalidCursorException.class,
+                () -> GetResultsHandler.decodeLastKey(badBinary));
+        assertThrows(GetResultsHandler.InvalidCursorException.class,
+                () -> GetResultsHandler.decodeLastKey(badNumber));
+    }
+
+    private static Map<String, AttributeValue> gsiKey(String testName) {
+        Map<String, AttributeValue> key = new LinkedHashMap<>();
+        key.put("submissionId", AttributeValue.fromS("sub-1"));
+        key.put("testName", AttributeValue.fromS(testName));
+        key.put("createdAt", AttributeValue.fromS("2024-01-01T00:00:00Z"));
+        return key;
+    }
+
+    private static String base64Url(String value) {
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void assertCorsHeadersPresent(APIGatewayProxyResponseEvent response) {
+        assertEquals("Content-Type,X-Admin-Login,X-Admin-Password",
+                response.getHeaders().get("Access-Control-Allow-Headers"));
+        assertEquals("OPTIONS,GET,POST",
+                response.getHeaders().get("Access-Control-Allow-Methods"));
+        assertEquals("application/json", response.getHeaders().get("Content-Type"));
     }
 
     private static Context context() {
