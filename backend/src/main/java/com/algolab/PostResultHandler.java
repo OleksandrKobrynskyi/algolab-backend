@@ -6,13 +6,19 @@ import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import com.google.gson.Gson;
-import com.google.gson.JsonSyntaxException;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -23,7 +29,12 @@ import java.util.UUID;
  */
 public class PostResultHandler implements RequestHandler<APIGatewayProxyRequestEvent, APIGatewayProxyResponseEvent> {
 
+    static final int MAX_BODY_BYTES = 102400;
+
     private static final Gson GSON = new Gson();
+
+    private static final DateTimeFormatter CREATED_AT_FORMAT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
 
     private final DynamoDbClient ddb;
     private final String tableName;
@@ -52,26 +63,39 @@ public class PostResultHandler implements RequestHandler<APIGatewayProxyRequestE
             return CorsUtil.buildResponse(200, Map.of(), requestHeaders);
         }
 
-        SubmissionRequest submission;
+        String body;
         try {
-            String body = request == null ? null : request.getBody();
-            submission = GSON.fromJson(body, SubmissionRequest.class);
-        } catch (JsonSyntaxException e) {
-            return CorsUtil.buildResponse(400, Map.of("error", "Malformed JSON"), requestHeaders);
+            body = readBody(request);
+        } catch (RuntimeException e) {
+            return CorsUtil.buildResponse(400, Map.of("error", "Malformed request body"), requestHeaders);
+        }
+        if (body == null || body.trim().isEmpty()) {
+            return CorsUtil.buildResponse(400, Map.of("error", "Request body is required"), requestHeaders);
+        }
+        if (body.getBytes(StandardCharsets.UTF_8).length > MAX_BODY_BYTES) {
+            return CorsUtil.buildResponse(400, Map.of("error", "Request body is too large"), requestHeaders);
         }
 
+        JsonElement root;
+        try {
+            root = JsonParser.parseString(body);
+        } catch (RuntimeException | StackOverflowError e) {
+            return CorsUtil.buildResponse(400, Map.of("error", "Malformed JSON"), requestHeaders);
+        }
+        if (root == null || !root.isJsonObject()) {
+            return CorsUtil.buildResponse(400, Map.of("error", "Request body must be a JSON object"),
+                    requestHeaders);
+        }
+
+        String[] error = new String[1];
+        SubmissionRequest submission = SubmissionRequest.fromJson(root.getAsJsonObject(), error);
         if (submission == null) {
-            return CorsUtil.buildResponse(400, Map.of("error", "Malformed JSON"), requestHeaders);
-        }
-
-        String validationError = submission.validate();
-        if (validationError != null) {
-            return CorsUtil.buildResponse(400, Map.of("error", validationError), requestHeaders);
+            return CorsUtil.buildResponse(400, Map.of("error", error[0]), requestHeaders);
         }
 
         try {
             String submissionId = UUID.randomUUID().toString();
-            String createdAt = Instant.now().toString();
+            String createdAt = formatCreatedAt(Instant.now());
 
             Map<String, AttributeValue> item = new LinkedHashMap<>();
             item.put("submissionId", AttributeValue.fromS(submissionId));
@@ -101,5 +125,30 @@ public class PostResultHandler implements RequestHandler<APIGatewayProxyRequestE
             }
             return CorsUtil.buildResponse(500, Map.of("error", "Internal server error"), requestHeaders);
         }
+    }
+
+    /**
+     * Returns the request body as text, base64-decoding it first when flagged.
+     * An implausibly long base64 string is reported as oversized without decoding it.
+     */
+    private static String readBody(APIGatewayProxyRequestEvent request) {
+        if (request == null || request.getBody() == null) {
+            return null;
+        }
+        String raw = request.getBody();
+        if (Boolean.TRUE.equals(request.getIsBase64Encoded())) {
+            if (raw.length() > (MAX_BODY_BYTES / 3 + 2) * 4 + 16) {
+                return "x".repeat(MAX_BODY_BYTES + 1);
+            }
+            return new String(Base64.getDecoder().decode(raw), StandardCharsets.UTF_8);
+        }
+        return raw;
+    }
+
+    /**
+     * Fixed-width (24 chars) UTC ISO-8601 timestamp with millisecond precision.
+     */
+    static String formatCreatedAt(Instant instant) {
+        return CREATED_AT_FORMAT.format(instant.truncatedTo(ChronoUnit.MILLIS));
     }
 }
