@@ -11,7 +11,7 @@ import * as path from 'path';
  * Never fall back to the `*` wildcard: CORS is enforced against an explicit
  * allowlist instead.
  */
-const defaultAllowedOrigins = ['https://oleksandr2903.github.io', 'http://localhost:5173'];
+const defaultAllowedOrigins = ['https://oleksandrkobrynskyi.github.io', 'http://localhost:5173'];
 
 function resolveAllowedOrigins(): string[] {
   const configured = process.env.ALLOWED_ORIGINS;
